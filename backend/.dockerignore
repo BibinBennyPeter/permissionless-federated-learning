@@ -1,0 +1,17 @@
+
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.git
+.gitignore
+.idea
+.vscode
+build
+dist
+*.db
+*.sqlite3
+EOF
