@@ -8,3 +8,10 @@ web3==7.14.0
 flwr==1.23.0
 flwr[simulation]
 flwr-datasets
+
+ipfshttpclient
+eth-account
+cryptography
+numpy
+
+dotenv
