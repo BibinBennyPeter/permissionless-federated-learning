@@ -176,6 +176,12 @@ def run_client_workflow(global_model, local_model, private_key_hex, round_num, n
         "signature": signed["signature"]
     }
 
+    # 8) Save manifest.json locally
+    manifest_path = os.path.join(artifact_dir, f"manifest_round{round_num}_{num_examples}.json")
+    with open(manifest_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Manifest written to: {manifest_path}")
+
     # print and return for demonstration
     print("Client payload ready:", json.dumps(payload, indent=2))
     return payload

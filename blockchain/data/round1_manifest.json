@@ -1,0 +1,20 @@
+[
+  {
+    "cid": "QmCid1",
+    "sha256": "ee6...",
+    "round": 1,
+    "num_examples": 120,
+    "quality": 300,
+    "submitter": "0xabc...",
+    "signature": "0x..."
+  },
+  {
+    "cid": "QmCid2",
+    "sha256": "9a2...",
+    "round": 1,
+    "num_examples": 80,
+    "quality": 200,
+    "submitter": "0xdef...",
+    "signature": "0x..."
+  }
+]
