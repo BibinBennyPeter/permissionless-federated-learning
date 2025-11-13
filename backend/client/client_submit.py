@@ -131,6 +131,20 @@ def sign_payload(private_key_hex, cid, round_num, num_examples, quality):
         "signature": signed.signature.hex()
     }
 
+
+# ---------------------
+# Load model from npz 
+# ---------------------
+def load_model_from_npz(npz_path, model_class):
+    data = np.load(npz_path)
+    model = model_class()
+    state_dict = model.state_dict()
+    for k in state_dict.keys():
+        arr = torch.from_numpy(data[k])
+        state_dict[k].copy_(arr)
+    model.load_state_dict(state_dict)
+    return model
+
 # ---------------------
 # Main client workflow (example)
 # ---------------------
@@ -190,23 +204,24 @@ def run_client_workflow(global_model, local_model, private_key_hex, round_num, n
 # Example usage (simulate)
 # ---------------------
 if __name__ == "__main__":
-    # simple simulated models for demo
     class TinyNet(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.fc = torch.nn.Linear(1,1)
         def forward(self,x): return self.fc(x)
 
-    # simulate a global model and a local fine-tuned model
-    global_model = TinyNet()
-    local_model = TinyNet()
-    # tweak local so it differs
-    with torch.no_grad():
-        local_model.fc.weight += 0.05
-        local_model.fc.bias += 0.02
+    # Load global model from .npz file
+    global_model_path = os.getenv("GLOBAL_MODEL_PATH", "aggregated/global_model_round1.npz")
+    global_model = load_model_from_npz(global_model_path, TinyNet)
 
-    # Provide a test private key (don't use this on mainnet)
+    # Simulate training local model
+    local_model = TinyNet()
+    with torch.no_grad():
+        local_model.fc.weight += torch.randn_like(local_model.fc.weight) * 0.05
+        local_model.fc.bias += torch.randn_like(local_model.fc.bias) * 0.02
+
+    # Load private key for signing
     test_priv = os.getenv("TEST_PRIVATE_KEY") 
-    # for Hardhat localhost, use one of the node private keys from hardhat node logs
 
     run_client_workflow(global_model, local_model, test_priv, round_num=1, num_examples=100, quality=250)
+
