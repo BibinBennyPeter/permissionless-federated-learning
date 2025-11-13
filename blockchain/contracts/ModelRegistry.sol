@@ -1,119 +1,160 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
-contract ModelRegistry is ERC721, AccessControl {
-    uint256 public nextTokenId;
+/// @notice Minimal on-chain registry for commits and published models (relayer-driven)
+contract ModelRegistry is AccessControl {
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
 
-    bytes32 public constant AGGREGATOR_ROLE = keccak256("AGGREGATOR_ROLE");
+    uint256 private _commitCounter;
+    uint256 private _modelCounter;
 
-    // A single submission record
-    struct Submission {
-        bytes32 modelHash;   // sha256 of client's (noised) update or IPFS CID
-        address submitter;   // client submitter or credited address
-        uint256 round;       // FL round number
-        uint256 quality;     // small integer score (e.g. scaled accuracy*1000)
-        uint256 numExamples; // optional: #examples used for weighting
-    }
-
-    // A training round's metadata
-    struct Round {
-        bytes32 merkleRoot;
-        string manifestCid;
-        bytes32 modelHash;
-        address aggregator;
+    struct Commit {
+        bytes32 commitHash;
+        address contributor;
+        uint256 roundId;
         uint256 timestamp;
     }
 
-    // Mapping round => submission hashes list (indexable)
-    mapping(uint256 => Submission[]) public submissionsByRound;
-
-    // Mapping round => Round metadata
-    mapping(uint256 => Round) public rounds;
-   
-    // event emitted when a new round is published
-    event RoundPublished(
-        uint256 indexed round,
-        bytes32 indexed merkleRoot,
-        string manifestCid,
-        bytes32 modelHash,
-        address indexed aggregator
-    );
-
-    // event emitted when submission recorded
-    event SubmissionRecorded(uint256 indexed round, bytes32 indexed modelHash, address indexed submitter, uint256 quality, uint256 numExamples);
-
-    // event emitted when an NFT is minted for a model
-    event ModelMinted(uint256 tokenId, bytes32 modelHash, address owner, string metadataUri);
-
-    constructor(string memory name_, string memory symbol_) ERC721(name_, symbol_) {
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(AGGREGATOR_ROLE, msg.sender);
+    struct Model {
+        uint256 modelId;
+        string ipfsCID;
+        bytes32 metadataHash;
+        uint256 qualityScore;
+        uint256 dpEpsilon;
+        address[] contributors;
+        uint256 publishTimestamp;
+        address publisher;
     }
 
-    /// @notice Record a submission on-chain (onlyOwner for now).
-    function recordSubmission(
-        bytes32 modelHash,
-        uint256 round,
-        address submitter,
-        uint256 quality,
-        uint256 numExamples
-    ) external onlyRole(AGGREGATOR_ROLE) {
-        submissionsByRound[round].push(Submission({
-            modelHash: modelHash,
-            submitter: submitter,
-            round: round,
-            quality: quality,
-            numExamples: numExamples
-        }));
+    mapping(uint256 => Commit) public commits;
+    mapping(uint256 => Model) private models;
+    mapping(bytes32 => bool) public usedCommitHashes;
+    mapping(uint256 => mapping(address => uint256)) public nftLinks; // modelId => nftContract => tokenId
 
-        emit SubmissionRecorded(round, modelHash, submitter, quality, numExamples);
+    event CommitRegistered(uint256 indexed commitId, bytes32 indexed commitHash, address indexed contributor, uint256 roundId);
+    event BatchCommitsRegistered(uint256 indexed firstCommitId, uint256 count, uint256 indexed roundId);
+    event ModelPublished(uint256 indexed modelId, string ipfsCID, bytes32 metadataHash, uint256 qualityScore, uint256 dpEpsilon, address indexed publisher);
+    event NFTLinked(uint256 indexed modelId, address indexed nftContract, uint256 indexed tokenId);
+
+    constructor(address admin) {
+        require(admin != address(0), "ModelRegistry: admin zero");
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(RELAYER_ROLE, admin);
     }
 
-    /// @notice Publish round metadata
-    function publishRound(
-        uint256 round,
-        bytes32 merkleRoot,
-        string calldata manifestCid,
-        bytes32 modelHash
-    ) external onlyRole(AGGREGATOR_ROLE) {
-        require(rounds[round].timestamp == 0, "Round already published");
-        rounds[round] = Round({
-            merkleRoot: merkleRoot,
-            manifestCid: manifestCid,
-            modelHash: modelHash,
-            aggregator: msg.sender,
+    /// @notice Register a single round commit (called by contributor or relayer on their behalf)
+    function registerRoundCommit(bytes32 commitHash, uint256 roundId) external returns (uint256 commitId) {
+        require(commitHash != bytes32(0), "ModelRegistry: invalid hash");
+        require(!usedCommitHashes[commitHash], "ModelRegistry: hash used");
+
+        commitId = _commitCounter++;
+        usedCommitHashes[commitHash] = true;
+
+        commits[commitId] = Commit({
+            commitHash: commitHash,
+            contributor: msg.sender,
+            roundId: roundId,
             timestamp: block.timestamp
         });
-        emit RoundPublished(round, merkleRoot, manifestCid, modelHash, msg.sender);
+
+        emit CommitRegistered(commitId, commitHash, msg.sender, roundId);
     }
 
-    /// @notice Mint an ERC-721 token representing a model
-    function mintModelNFT(
-        bytes32 modelHash,
-        address to,
-        string calldata metadataUri
-    ) external onlyRole(AGGREGATOR_ROLE) returns (uint256) {
-        uint256 tokenId = ++nextTokenId;
-        _mint(to, tokenId);
-        emit ModelMinted(tokenId, modelHash, to, metadataUri);
-        return tokenId;
+    /// @notice Batch register commits (relayer-only). Demo limit: 100 items per batch.
+    function registerRoundCommits(
+        bytes32[] calldata commitHashes,
+        uint256[] calldata roundIds,
+        address[] calldata contributors
+    ) external onlyRole(RELAYER_ROLE) {
+        uint256 len = commitHashes.length;
+        require(len > 0, "ModelRegistry: empty");
+        require(len == roundIds.length && len == contributors.length, "ModelRegistry: array mismatch");
+        require(len <= 100, "ModelRegistry: batch too large");
+
+        uint256 firstId = _commitCounter;
+        uint256 roundId = roundIds[0];
+
+        for (uint256 i = 0; i < len; ++i) {
+            bytes32 h = commitHashes[i];
+            require(h != bytes32(0), "ModelRegistry: invalid hash");
+            require(!usedCommitHashes[h], "ModelRegistry: hash used");
+            require(contributors[i] != address(0), "ModelRegistry: invalid contributor");
+
+            uint256 id = _commitCounter++;
+            usedCommitHashes[h] = true;
+
+            commits[id] = Commit({
+                commitHash: h,
+                contributor: contributors[i],
+                roundId: roundIds[i],
+                timestamp: block.timestamp
+            });
+
+            emit CommitRegistered(id, h, contributors[i], roundIds[i]);
+        }
+
+        emit BatchCommitsRegistered(firstId, len, roundId);
     }
 
-    /// @notice Simple getter: number of submissions in a round
-    function submissionsCount(uint256 round) external view returns (uint256) {
-        return submissionsByRound[round].length;
+    /// @notice Publish model (relayer-only). Off-chain aggregation/validation expected before this call.
+    function publishModel(
+        string calldata ipfsCID,
+        bytes32 metadataHash,
+        uint256 qualityScore,
+        uint256 dpEpsilon,
+        address[] calldata contributors
+    ) external onlyRole(RELAYER_ROLE) returns (uint256 modelId) {
+        require(bytes(ipfsCID).length > 0, "ModelRegistry: empty cid");
+        require(metadataHash != bytes32(0), "ModelRegistry: invalid metadata");
+        require(contributors.length > 0, "ModelRegistry: no contributors");
+
+        uint256 id = _modelCounter++;
+
+        models[id].modelId = id;
+        models[id].ipfsCID = ipfsCID;
+        models[id].metadataHash = metadataHash;
+        models[id].qualityScore = qualityScore;
+        models[id].dpEpsilon = dpEpsilon;
+        models[id].contributors = contributors;
+        models[id].publishTimestamp = block.timestamp;
+        models[id].publisher = msg.sender;
+
+        emit ModelPublished(id, ipfsCID, metadataHash, qualityScore, dpEpsilon, msg.sender);
+        return id;
     }
 
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        virtual
-        override(ERC721, AccessControl)
-        returns (bool)
-    {
-        return super.supportsInterface(interfaceId);
+    /// @notice Link NFT to model (relayer-only)
+    function linkNFT(uint256 modelId, address nftContract, uint256 tokenId) external onlyRole(RELAYER_ROLE) {
+        require(models[modelId].modelId == modelId, "ModelRegistry: model missing");
+        require(nftContract != address(0), "ModelRegistry: invalid nft");
+        nftLinks[modelId][nftContract] = tokenId;
+        emit NFTLinked(modelId, nftContract, tokenId);
     }
+
+    /// @notice Get model details
+    function getModel(uint256 modelId) external view returns (
+        uint256, string memory, bytes32, uint256, uint256, address[] memory, uint256, address
+    ) {
+        Model storage m = models[modelId];
+        return (
+            m.modelId,
+            m.ipfsCID,
+            m.metadataHash,
+            m.qualityScore,
+            m.dpEpsilon,
+            m.contributors,
+            m.publishTimestamp,
+            m.publisher
+        );
+    }
+
+    function getCommit(uint256 commitId) external view returns (bytes32, address, uint256, uint256) {
+        Commit storage c = commits[commitId];
+        return (c.commitHash, c.contributor, c.roundId, c.timestamp);
+    }
+
+    function totalCommits() external view returns (uint256) { return _commitCounter; }
+    function totalModels() external view returns (uint256) { return _modelCounter; }
 }
