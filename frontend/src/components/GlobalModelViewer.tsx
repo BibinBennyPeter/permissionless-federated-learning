@@ -44,7 +44,8 @@ export default function GlobalModelViewer() {
 
   const handleViewIPFS = () => {
     if (model?.cid) {
-      window.open(`https://ipfs.io/ipfs/${model.cid}`, '_blank');
+     // window.open(`https://ipfs.io/ipfs/${model.cid}`, '_blank');
+      window.open(`http://127.0.0.1:8080/ipfs/${model.cid}`, '_blank');
     }
   };
 
