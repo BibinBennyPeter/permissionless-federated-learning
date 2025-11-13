@@ -132,7 +132,7 @@ def run_aggregation(manifest_dir: str = DEFAULT_MANIFEST_DIR,
         print(f"[warn] failed to upload aggregated model to IPFS: {e}")
 
     # write combined manifest array (the aggregator manifest)
-    manifest_out = out_dir / f"manifest_round{round_number}_all.json"
+    manifest_out = out_dir / f"global_model"
     save_json(submissions, manifest_out)
     print(f"[aggregate] wrote combined manifest to {manifest_out}")
 

@@ -32,3 +32,4 @@ final_model.pt
 # Other
 *.log
 artifacts/
+aggregated/
