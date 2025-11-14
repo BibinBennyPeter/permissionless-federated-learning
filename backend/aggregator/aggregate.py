@@ -6,7 +6,7 @@ backend/aggregator/aggregate.py
 - Verifies minimal payload shape (and optionally signatures).
 - Fetches each client's .npz from IPFS, loads delta, and computes weighted FedAvg.
 - Writes aggregated global model .npz, uploads model + manifest to IPFS (optional).
-- Returns result metadata dict.
+- Returns result metadata dict with contributors, quality_score, and dp_epsilon for on-chain publishing.
 """
 
 import os
@@ -132,7 +132,7 @@ def run_aggregation(manifest_dir: str = DEFAULT_MANIFEST_DIR,
         print(f"[warn] failed to upload aggregated model to IPFS: {e}")
 
     # write combined manifest array (the aggregator manifest)
-    manifest_out = out_dir / f"global_model"
+    manifest_out = out_dir / f"global_model_round{round_number}_manifest.json"
     save_json(submissions, manifest_out)
     print(f"[aggregate] wrote combined manifest to {manifest_out}")
 
@@ -144,6 +144,11 @@ def run_aggregation(manifest_dir: str = DEFAULT_MANIFEST_DIR,
         except Exception as e:
             print(f"[warn] failed to upload manifest: {e}")
 
+    # Extract contributors, quality_score, and dp_epsilon for on-chain publishing
+    contributors = [entry["submitter"] for entry in submissions]
+    quality_score = sum(int(entry["quality"]) for entry in submissions)
+    dp_epsilon = 5  # Fixed constant matching noise scale used during training
+
     result = {
         "round": round_number,
         "model_local_path": str(global_model_path),
@@ -152,6 +157,9 @@ def run_aggregation(manifest_dir: str = DEFAULT_MANIFEST_DIR,
         "manifest_local_path": str(manifest_out),
         "manifest_cid": manifest_cid,
         "num_submissions": len(submissions),
+        "contributors": contributors,
+        "quality_score": quality_score,
+        "dp_epsilon": dp_epsilon,
     }
     return result
 

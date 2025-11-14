@@ -1,6 +1,4 @@
-
 """
-client_submit.py
 Client-side pipeline for permissionless FL :
 - compute delta (local - global)
 - clip, add Gaussian noise (DP)
@@ -9,6 +7,7 @@ Client-side pipeline for permissionless FL :
 - upload to local IPFS daemon
 - sign the CID+meta with an Ethereum key (eth-account)
 - produce JSON payload to send to aggregator
+- prepare commit payload for frontend blockchain submission
 """
 
 import os
@@ -49,9 +48,19 @@ def deterministic_state_dict_bytes(state_dict):
     return b"".join(parts)
 
 def sha256_bytes(b):
+    """Compute SHA256 hash and return as hex string."""
     h = hashlib.sha256()
     h.update(b)
     return h.hexdigest()
+
+def sha256_to_bytes32(sha256_hex):
+    """
+    Convert a SHA256 hex string to a bytes32 hex string with '0x' prefix.
+    This is the format expected by the smart contract for commitHash.
+    """
+    if sha256_hex.startswith("0x"):
+        return sha256_hex
+    return "0x" + sha256_hex
 
 # ---------------------
 # Delta / clipping / noise (L2 clip + Gaussian noise)
@@ -116,6 +125,7 @@ def upload_to_ipfs(path, api_url):
         return j["Hash"]
     except Exception as ex:
         raise RuntimeError(f"Failed to parse IPFS add response: {resp.text}") from ex
+
 # ---------------------
 # Ethereum signing (eth-account)
 # ---------------------
@@ -164,15 +174,17 @@ def run_client_workflow(global_model, local_model, private_key_hex, round_num, n
     artifact_path = os.path.join(artifact_dir, f"delta_round{round_num}_{num_examples}.npz")
     save_delta_npz(delta_noised, artifact_path)
 
-    # 4) compute canonical sha256 (optional, for local verification)
-    # We can re-create deterministic bytes from delta dict and sha256 them.
-    # For convenience, compute sha over the .npz file bytes:
+    # 4) compute canonical sha256 of artifact file bytes
+    # This hash will be used as the commitHash for the smart contract
     with open(artifact_path, "rb") as f:
         file_bytes = f.read()
     file_sha256 = sha256_bytes(file_bytes)
+    
+    # Convert to bytes32 format (0x-prefixed) for smart contract
+    commit_hash = sha256_to_bytes32(file_sha256)
 
     # 5) upload to IPFS
-    ipfs_api = os.getenv("IPFS_API")
+    ipfs_api = os.getenv("IPFS_API", "http://127.0.0.1:5001/api/v0/add")
     cid = upload_to_ipfs(artifact_path, ipfs_api)
 
     # 6) sign the CID + meta
@@ -190,15 +202,49 @@ def run_client_workflow(global_model, local_model, private_key_hex, round_num, n
         "signature": signed["signature"]
     }
 
-    # 8) Save manifest.json locally
+    # 8) Save manifest.json locally (existing workflow)
     manifest_path = os.path.join(artifact_dir, f"manifest_round{round_num}_{num_examples}.json")
     with open(manifest_path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"Manifest written to: {manifest_path}")
+    print(f"✓ Manifest written to: {manifest_path}")
 
-    # print and return for demonstration
-    print("Client payload ready:", json.dumps(payload, indent=2))
-    return payload
+    # 9) NEW: Prepare commit payload for frontend blockchain submission
+    # This payload contains all fields needed for registerRoundCommit() via Ethers.js
+    commit_payload = {
+        "commitHash": commit_hash,  # bytes32 format (0x-prefixed SHA256 of artifact)
+        "cid": cid,                 # IPFS CID
+        "round": round_num,         # Training round number
+        "sha256": file_sha256,      # SHA256 hash (without 0x prefix, for reference)
+        "submitter": signed["address"],  # Ethereum address of contributor
+        "signature": signed["signature"], # Signature hex
+        "message": signed["message"],     # Original signed message
+        "num_examples": num_examples,     # Number of training examples
+        "quality": quality                # Quality metric
+    }
+
+    # 10) Write commit payload to separate JSON file for frontend pickup
+    commit_payload_path = os.path.join(artifact_dir, f"commit_payload_round{round_num}_{num_examples}.json")
+    with open(commit_payload_path, "w") as f:
+        json.dump(commit_payload, f, indent=2)
+    
+    print(f"✓ Commit payload written to: {commit_payload_path}")
+    print(f"\n{'='*60}")
+    print(f"READY FOR BLOCKCHAIN SUBMISSION")
+    print(f"{'='*60}")
+    print(f"Commit Hash (bytes32): {commit_hash}")
+    print(f"Round ID: {round_num}")
+    print(f"Submitter Address: {signed['address']}")
+    print(f"\nThe commit payload is ready for the frontend to submit via Ethers.js")
+    print(f"Frontend should call: registerRoundCommit(commitHash, roundId)")
+    print(f"{'='*60}\n")
+
+    # print aggregator payload for demonstration
+    print("Aggregator payload:", json.dumps(payload, indent=2))
+    
+    return {
+        "aggregator_payload": payload,
+        "commit_payload": commit_payload
+    }
 
 # ---------------------
 # Example usage (simulate)
@@ -212,6 +258,18 @@ if __name__ == "__main__":
 
     # Load global model from .npz file
     global_model_path = os.getenv("GLOBAL_MODEL_PATH", "aggregated/global_model_round1.npz")
+    
+    # Check if global model exists, otherwise create a dummy one
+    if not os.path.exists(global_model_path):
+        print(f"Warning: Global model not found at {global_model_path}, creating dummy model")
+        os.makedirs(os.path.dirname(global_model_path) or ".", exist_ok=True)
+        dummy_model = TinyNet()
+        # Save dummy model
+        state_dict = dummy_model.state_dict()
+        npz_dict = {k: v.cpu().detach().numpy().astype(np.float32) for k, v in state_dict.items()}
+        np.savez_compressed(global_model_path, **npz_dict)
+        print(f"Created dummy global model at {global_model_path}")
+    
     global_model = load_model_from_npz(global_model_path, TinyNet)
 
     # Simulate training local model
@@ -221,7 +279,23 @@ if __name__ == "__main__":
         local_model.fc.bias += torch.randn_like(local_model.fc.bias) * 0.02
 
     # Load private key for signing
-    test_priv = os.getenv("TEST_PRIVATE_KEY") 
+    test_priv = os.getenv("TEST_PRIVATE_KEY", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
 
-    run_client_workflow(global_model, local_model, test_priv, round_num=1, num_examples=100, quality=250)
-
+    result = run_client_workflow(
+        global_model, 
+        local_model, 
+        test_priv, 
+        round_num=1, 
+        num_examples=100, 
+        quality=250
+    )
+    
+    print("\n" + "="*60)
+    print("WORKFLOW COMPLETE")
+    print("="*60)
+    print("1. Aggregator payload saved to: artifacts/manifest_round1_100.json")
+    print("2. Commit payload saved to: artifacts/commit_payload_round1_100.json")
+    print("\nNext steps:")
+    print("- Send aggregator payload to aggregator server")
+    print("- Use commit payload in frontend to call registerRoundCommit()")
+    print("="*60)

@@ -35,22 +35,40 @@ app.get("/global", (req, res) => {
     const data = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
 
     let modelCid = null;
-    let sha256 = null;
+    let modelSha256 = null;
     let round = null;
+    let contributors = [];
+    let qualityScore = null;
+    let dpEpsilon = null;
 
     if (Array.isArray(data) && data.length > 0) {
       const entry = data.sort((a, b) => (b.round || 0) - (a.round || 0))[0];
-      modelCid = entry.cid || null;
-      sha256 = entry.sha256 || null;
+      modelCid = entry.model_cid || null;
+      modelSha256 = entry.model_sha256 || null;
       round = entry.round ?? null;
-      console.log("Model CID:", modelCid, "SHA256:", sha256, "Round:", round);
+      contributors = entry.contributors || [];
+      qualityScore = entry.quality_score ?? null;
+      dpEpsilon = entry.dp_epsilon ?? null;
+      console.log("Model CID:", modelCid, "SHA256:", modelSha256, "Round:", round);
     } else if (data && typeof data === 'object') {
-      modelCid = data.cid || null;
-      sha256 = data.sha256 || null;
+      modelCid = data.model_cid || null;
+      modelSha256 = data.model_sha256 || null;
       round = data.round ?? null;
+      contributors = data.contributors || [];
+      qualityScore = data.quality_score ?? null;
+      dpEpsilon = data.dp_epsilon ?? null;
     }
 
-    return res.json({ ok: true, model_file: f, cid: modelCid, sha256, round });
+    return res.json({ 
+      ok: true, 
+      model_file: f, 
+      cid: modelCid, 
+      sha256: modelSha256, 
+      round,
+      contributors,
+      quality_score: qualityScore,
+      dp_epsilon: dpEpsilon
+    });
   } catch (err) {
     console.error("Error in /global handler:", err);
     return res.status(500).json({ ok: false, err: err.message });
@@ -107,9 +125,35 @@ app.post("/submit-payload", (req, res) => {
 
 app.post("/aggregate", (req, res) => {
   try {
+    // Extract round from request body, default to 1
+    const round = req.body.round || 1;
+
+    // Pre-check: ensure at least one submission manifest exists for this round
+    if (!fs.existsSync(SUBMISSIONS_DIR)) {
+      return res.status(400).json({ 
+        ok: false, 
+        msg: "submissions directory does not exist" 
+      });
+    }
+
+    const files = fs.readdirSync(SUBMISSIONS_DIR);
+    const manifestFiles = files.filter(f => 
+      f.startsWith(`manifest_round${round}_`) && f.endsWith('.json')
+    );
+
+    if (manifestFiles.length === 0) {
+      return res.status(400).json({ 
+        ok: false, 
+        msg: `no submissions found for round ${round}` 
+      });
+    }
+
+    console.log(`Found ${manifestFiles.length} submission(s) for round ${round}`);
+
+    // Execute aggregation
     const cwd = path.join(__dirname, "..");
-    const out = execFileSync("python3", ["aggregator/aggregate.py", "--round", "1"], { cwd, stdio: "pipe" });
-    return res.json({ ok: true, out: out.toString() });
+    const out = execFileSync("python3", ["aggregator/aggregate.py", "--round", String(round)], { cwd, stdio: "pipe" });
+    return res.json({ ok: true, out: out.toString(), round, submissions_count: manifestFiles.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok:false, err: err.message, stdout: err.stdout && err.stdout.toString() });

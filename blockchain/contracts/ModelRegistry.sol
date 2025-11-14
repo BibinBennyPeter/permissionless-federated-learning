@@ -3,12 +3,18 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
-/// @notice Minimal on-chain registry for commits and published models (relayer-driven)
+interface IRewardToken {
+    function mint(address to, uint256 amount) external;
+}
+
+/// @notice On-chain registry for commits and published models with integrated reward distribution
 contract ModelRegistry is AccessControl {
     bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
 
     uint256 private _commitCounter;
     uint256 private _modelCounter;
+
+    IRewardToken public immutable rewardToken;
 
     struct Commit {
         bytes32 commitHash;
@@ -24,22 +30,42 @@ contract ModelRegistry is AccessControl {
         uint256 qualityScore;
         uint256 dpEpsilon;
         address[] contributors;
+        uint256[] rewards;
         uint256 publishTimestamp;
         address publisher;
+        uint256 roundId;
     }
 
     mapping(uint256 => Commit) public commits;
-    mapping(uint256 => Model) private models;
+    mapping(uint256 => Model) public models;
     mapping(bytes32 => bool) public usedCommitHashes;
     mapping(uint256 => mapping(address => uint256)) public nftLinks; // modelId => nftContract => tokenId
 
     event CommitRegistered(uint256 indexed commitId, bytes32 indexed commitHash, address indexed contributor, uint256 roundId);
     event BatchCommitsRegistered(uint256 indexed firstCommitId, uint256 count, uint256 indexed roundId);
-    event ModelPublished(uint256 indexed modelId, string ipfsCID, bytes32 metadataHash, uint256 qualityScore, uint256 dpEpsilon, address indexed publisher);
+    event ModelPublished(
+        uint256 indexed modelId, 
+        string ipfsCID, 
+        bytes32 metadataHash, 
+        uint256 qualityScore, 
+        uint256 dpEpsilon, 
+        address indexed publisher,
+        uint256 roundId
+    );
+    event ContributorRewarded(
+        address indexed contributor,
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 tokensAllocated
+    );
     event NFTLinked(uint256 indexed modelId, address indexed nftContract, uint256 indexed tokenId);
 
-    constructor(address admin) {
+    constructor(address admin, address _rewardToken) {
         require(admin != address(0), "ModelRegistry: admin zero");
+        require(_rewardToken != address(0), "ModelRegistry: reward token zero");
+        
+        rewardToken = IRewardToken(_rewardToken);
+        
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(RELAYER_ROLE, admin);
     }
@@ -98,30 +124,57 @@ contract ModelRegistry is AccessControl {
         emit BatchCommitsRegistered(firstId, len, roundId);
     }
 
-    /// @notice Publish model (relayer-only). Off-chain aggregation/validation expected before this call.
+    /// @notice Publish model with integrated reward distribution (relayer-only)
+    /// @param ipfsCID IPFS content identifier for the model
+    /// @param metadataHash Hash of model metadata
+    /// @param qualityScore Quality metric for the model
+    /// @param dpEpsilon Differential privacy epsilon value
+    /// @param contributors Array of contributor addresses
+    /// @param rewardAmounts Array of reward amounts corresponding to each contributor
+    /// @param roundId The training round identifier
     function publishModel(
         string calldata ipfsCID,
         bytes32 metadataHash,
         uint256 qualityScore,
         uint256 dpEpsilon,
-        address[] calldata contributors
+        address[] calldata contributors,
+        uint256[] calldata rewardAmounts,
+        uint256 roundId
     ) external onlyRole(RELAYER_ROLE) returns (uint256 modelId) {
         require(bytes(ipfsCID).length > 0, "ModelRegistry: empty cid");
         require(metadataHash != bytes32(0), "ModelRegistry: invalid metadata");
         require(contributors.length > 0, "ModelRegistry: no contributors");
+        require(contributors.length == rewardAmounts.length, "ModelRegistry: array mismatch");
 
         uint256 id = _modelCounter++;
 
+        // Store model data
         models[id].modelId = id;
         models[id].ipfsCID = ipfsCID;
         models[id].metadataHash = metadataHash;
         models[id].qualityScore = qualityScore;
         models[id].dpEpsilon = dpEpsilon;
         models[id].contributors = contributors;
+        models[id].rewards = rewardAmounts;
         models[id].publishTimestamp = block.timestamp;
         models[id].publisher = msg.sender;
+        models[id].roundId = roundId;
 
-        emit ModelPublished(id, ipfsCID, metadataHash, qualityScore, dpEpsilon, msg.sender);
+        // Distribute rewards to contributors
+        for (uint256 i = 0; i < contributors.length; ++i) {
+            address contributor = contributors[i];
+            uint256 reward = rewardAmounts[i];
+            
+            require(contributor != address(0), "ModelRegistry: invalid contributor");
+            require(reward > 0, "ModelRegistry: zero reward");
+
+            // Mint reward tokens directly to contributor
+            rewardToken.mint(contributor, reward);
+
+            emit ContributorRewarded(contributor, id, roundId, reward);
+        }
+
+        emit ModelPublished(id, ipfsCID, metadataHash, qualityScore, dpEpsilon, msg.sender, roundId);
         return id;
     }
 
@@ -133,9 +186,18 @@ contract ModelRegistry is AccessControl {
         emit NFTLinked(modelId, nftContract, tokenId);
     }
 
-    /// @notice Get model details
+    /// @notice Get comprehensive model details including rewards
     function getModel(uint256 modelId) external view returns (
-        uint256, string memory, bytes32, uint256, uint256, address[] memory, uint256, address
+        uint256, 
+        string memory, 
+        bytes32, 
+        uint256, 
+        uint256, 
+        address[] memory, 
+        uint256[] memory,
+        uint256, 
+        address,
+        uint256
     ) {
         Model storage m = models[modelId];
         return (
@@ -145,16 +207,51 @@ contract ModelRegistry is AccessControl {
             m.qualityScore,
             m.dpEpsilon,
             m.contributors,
+            m.rewards,
             m.publishTimestamp,
-            m.publisher
+            m.publisher,
+            m.roundId
         );
     }
 
-    function getCommit(uint256 commitId) external view returns (bytes32, address, uint256, uint256) {
+    /// @notice Get the latest model CID and round
+    function getLatestModel(uint256 modelId) external view returns (
+        string memory ipfsCID,
+        uint256 roundId
+    ) {
+        Model storage m = models[modelId];
+        require(m.modelId == modelId, "ModelRegistry: model not found");
+        return (m.ipfsCID, m.roundId);
+    }
+
+    /// @notice Get commit details
+    function getCommit(uint256 commitId) external view returns (
+        bytes32, 
+        address, 
+        uint256, 
+        uint256
+    ) {
         Commit storage c = commits[commitId];
         return (c.commitHash, c.contributor, c.roundId, c.timestamp);
     }
 
-    function totalCommits() external view returns (uint256) { return _commitCounter; }
-    function totalModels() external view returns (uint256) { return _modelCounter; }
+    /// @notice Get contributor rewards for a specific model
+    function getContributorRewards(uint256 modelId) external view returns (
+        address[] memory contributors,
+        uint256[] memory rewards
+    ) {
+        Model storage m = models[modelId];
+        require(m.modelId == modelId, "ModelRegistry: model not found");
+        return (m.contributors, m.rewards);
+    }
+
+    /// @notice Get total number of commits registered
+    function totalCommits() external view returns (uint256) { 
+        return _commitCounter; 
+    }
+
+    /// @notice Get total number of models published
+    function totalModels() external view returns (uint256) { 
+        return _modelCounter; 
+    }
 }
